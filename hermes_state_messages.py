@@ -11,8 +11,8 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.context_compressor import (
-    _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, _is_checkpoint_item,
-    _newest_checkpoint_carrier, split_user_originated_turn)
+    _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, _SUMMARY_END_MARKER,
+    _is_checkpoint_item, _newest_checkpoint_carrier, split_user_originated_turn)
 from agent.memory_manager import sanitize_context
 from agent.message_metadata import CANONICAL_ROW, DB_ROW_SNAPSHOT
 from agent.message_sanitization import _sanitize_surrogates
@@ -52,6 +52,18 @@ _DISPLAY_ACTIVE_CLAUSE = " AND (active = 1 OR compacted = 1)"
 DISPLAY_VISIBLE_SQL = (
     f" AND COALESCE({_sql_json_extract('display_metadata', '$.' + MODEL_ONLY_DISPLAY_METADATA_KEY)}, 0) = 0")
 _DISPLAY_META_ROW_SQL = "SELECT display_metadata FROM messages WHERE id = ? AND session_id IN ({ids})" + _DISPLAY_ACTIVE_CLAUSE
+
+
+def _is_summary_carrier_row(role: Any, content: Any) -> bool:
+    """A user row whose stored content still carries the compaction handoff scaffolding (summary +
+    end marker) around the live ask — the durable twin of the model's force-user-leading carrier.
+    Its display identity normalizes back to the plain ask, so it shares a display slot with the
+    durable prompt; a display projection must serve the plain row, the model restore the carrier."""
+    if role != "user":
+        return False
+    if isinstance(content, (bytes, bytearray)):
+        content = content.decode("utf-8", "replace")
+    return isinstance(content, str) and _SUMMARY_END_MARKER in content
 # A display row is indexed only when both halves are set; the read path backfills before projecting, so
 # the in-transaction delete fence must refuse (not project) any session this probe still matches.
 _DISPLAY_INDEX_MISSING_SQL = ("SELECT 1 FROM messages WHERE session_id = ?" + _DISPLAY_ACTIVE_CLAUSE
@@ -959,19 +971,29 @@ class SessionMessagesMixin:
         highest id — the preference ``_display_rows_from_conn`` uses) and rewind the
         rest (``active = 0, compacted = 0``). Model-only rows are never display-visible
         and are left untouched.
+
+        A group whose surviving row is the turn's SUMMARY CARRIER is exempt: the carrier
+        renders as handoff scaffolding, so the plain original is the only clean render of
+        that user turn and must stay display-visible for the display pick to serve it
+        (#126102 — see ``_is_summary_carrier_row``).
         """
         cur = conn.execute(
             f"""UPDATE messages SET active = 0, compacted = 0 WHERE id IN (
                     SELECT id FROM (
                         SELECT id, ROW_NUMBER() OVER (
                             PARTITION BY display_identity ORDER BY active DESC, id DESC
-                        ) AS rn
+                        ) AS rn,
+                        FIRST_VALUE(CASE WHEN role = 'user'
+                                          AND instr(COALESCE(content, ''), ?) > 0
+                                     THEN 1 ELSE 0 END) OVER (
+                            PARTITION BY display_identity ORDER BY active DESC, id DESC
+                        ) AS carrier_head
                         FROM messages WHERE session_id = ?
                         AND (active = 1 OR compacted = 1){DISPLAY_VISIBLE_SQL}
                         AND display_identity IS NOT NULL
-                    ) WHERE rn > 1
+                    ) WHERE rn > 1 AND carrier_head = 0
                 )""",
-            (session_id,))
+            (_SUMMARY_END_MARKER, session_id))
         return cur.rowcount or 0
 
     def _archive_named_rows(
@@ -1207,18 +1229,25 @@ class SessionMessagesMixin:
         """Fixed-width durable identity for indexed display-generation lookup."""
         return hashlib.sha256(repr(key).encode("utf-8", "surrogatepass")).digest()
 
-    def _dedupe_display_generations(self, rows):
+    def _dedupe_display_generations(self, rows, *, for_display: bool = False):
         """Collapse compaction generations so each logical message appears once (the protected tail is copied
         into each generation: same role/content/timestamp, different ``active``/id); prefer the live row, then
-        the newest. The ONE definition every display projection shares. *rows* must be ordered by ``id``."""
+        the newest. The ONE definition every display projection shares. *rows* must be ordered by ``id``.
+        ``for_display``: a plain prompt outranks its summary carrier — the carrier keeps the model's
+        summary scaffolding, the display must show the user's ask (#126102)."""
         seen: Dict[Tuple[Any, ...], Any] = {}
         first_id: Dict[Tuple[Any, ...], int] = {}
+
+        def _preference(row):
+            return (not (for_display and _is_summary_carrier_row(row["role"], row["content"])),
+                    row["active"], row["id"])
+
         for row in rows:
             if self._is_model_only_row(row):
                 continue
             key = self._display_dedupe_key(row)
             cur = seen.get(key)
-            if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
+            if cur is None or _preference(row) > _preference(cur):
                 seen[key] = row
             first_id[key] = min(first_id.get(key, row["id"]), row["id"])
         # Order by the logical message's FIRST row, not the chosen representative's: a protected-tail
@@ -1281,7 +1310,7 @@ class SessionMessagesMixin:
     def _legacy_display_page(self, session_id: str, *, active_clause: str, limit: Optional[int], offset: int,
                              latest: bool) -> List[Any]:
         """Project a legacy read-only display page without retaining transcript payloads."""
-        representatives: Dict[bytes, Tuple[int, int]] = {}
+        representatives: Dict[bytes, Tuple[bool, int, int]] = {}
         with self._read_ctx() as conn:
             conn.execute("BEGIN")
             try:
@@ -1300,14 +1329,17 @@ class SessionMessagesMixin:
                         continue
                     identity = self._display_identity(self._display_dedupe_key(row))
                     current = representatives.get(identity)
-                    candidate = (row["active"], row["id"])
+                    # A plain prompt outranks its summary carrier (#126102 — see
+                    # _display_rows_from_conn, the indexed twin of this pick).
+                    candidate = (not _is_summary_carrier_row(row["role"], row["content"]),
+                                 row["active"], row["id"])
                     if current is None or candidate > current:
                         representatives[identity] = candidate
                 rows.close()
 
                 identities = list(representatives)
                 identities = identities[::-1][offset:][:limit][::-1] if latest else identities[offset:][:limit]
-                selected_ids = [representatives[identity][1] for identity in identities]
+                selected_ids = [representatives[identity][2] for identity in identities]
                 selected = {}
                 for start in range(0, len(selected_ids), 900):
                     chunk = selected_ids[start:start + 900]
@@ -1347,7 +1379,11 @@ class SessionMessagesMixin:
     @staticmethod
     def _display_rows_from_conn(conn, session_id: str, *, limit: Optional[int] = None,
                                 offset: int = 0, latest: bool = False):
-        """One display-history projection for normal reads and transactional verification."""
+        """One display-history projection for normal reads and transactional verification.
+
+        A summary carrier (``_is_summary_carrier_row``) shares its display slot with the durable
+        plain prompt; the plain row outranks the carrier so clients that hydrate raw content show
+        the user's ask, never ``[CONTEXT COMPACTION …]`` scaffolding (#126102)."""
         direction = "DESC" if latest else "ASC"
         return conn.execute(
             f"""WITH page AS (
@@ -1362,10 +1398,12 @@ class SessionMessagesMixin:
                    WHERE candidate.session_id = ?
                      AND candidate.display_order = page.display_order
                      AND (candidate.active = 1 OR candidate.compacted = 1){DISPLAY_VISIBLE_SQL}
-                   ORDER BY candidate.active DESC, candidate.id DESC LIMIT 1
+                   ORDER BY (candidate.role = 'user'
+                             AND instr(COALESCE(candidate.content, ''), ?) > 0) ASC,
+                            candidate.active DESC, candidate.id DESC LIMIT 1
                )
                ORDER BY page.display_order ASC""",
-            (session_id, -1 if limit is None else limit, offset, session_id),
+            (session_id, -1 if limit is None else limit, offset, session_id, _SUMMARY_END_MARKER),
         ).fetchall()
 
     def _display_messages_from_conn(self, conn, session_id: str) -> Optional[List[Dict[str, Any]]]:
@@ -1617,7 +1655,7 @@ class SessionMessagesMixin:
             [r for r in rows if r["session_id"] == session_id and r["active"]], session_id=session_id,
             include_ancestors=False, repair_alternation=True, include_row_ids=True, include_summary_markers=True)
         display_history = self._rows_to_conversation(
-            self._dedupe_display_generations(rows), session_id=session_id,
+            self._dedupe_display_generations(rows, for_display=True), session_id=session_id,
             include_ancestors=True, repair_alternation=False, include_row_ids=True)
         return model_history, display_history
 
@@ -1667,7 +1705,8 @@ class SessionMessagesMixin:
         if len(session_ids) <= 1:
             return []
         rows = self._dedupe_display_generations(
-            self._fetch_conversation_rows(session_ids, _DISPLAY_ACTIVE_CLAUSE, with_session_id=True))
+            self._fetch_conversation_rows(session_ids, _DISPLAY_ACTIVE_CLAUSE, with_session_id=True),
+            for_display=True)
         ancestor_ids = {int(row["id"]) for row in rows if row["session_id"] != session_id and row["id"] is not None}
         if not ancestor_ids:
             return []

@@ -378,9 +378,12 @@ class TestDisplayDedupe:
             if read_only:
                 reader.close()
 
-        assert [message["id"] for message in messages] == [carrier_id, later_id]
-        assert messages[0]["content"] == carrier
-        assert original_id not in [message["id"] for message in messages]
+        # The display serves the PLAIN prompt, never the composite carrier's raw
+        # scaffolding: clients hydrate content as-is and would paint the summary
+        # instead of the user's ask (#126102). The carrier keeps the model context.
+        assert [message["id"] for message in messages] == [original_id, later_id]
+        assert messages[0]["content"] == "live ask"
+        assert carrier_id not in [message["id"] for message in messages]
         # Index columns never escape the message dict (BLOB identity is not JSON-serializable).
         assert not {"display_identity", "display_order"} & set(messages[0])
         json.dumps(messages)
